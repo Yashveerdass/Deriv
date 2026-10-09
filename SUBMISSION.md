@@ -1,213 +1,244 @@
-# Ticket Triage Pipeline: Submission Notes
+# Ticket Triage Pipeline: Submission
 
-A small, replayable AI ticket-triage pipeline. It reads support tickets and a label schema from local JSON files, cleans the text deterministically, classifies each ticket with a structured LLM call, routes low-confidence or invalid results to human review **using code rather than the model**, drafts replies only for auto-triaged tickets, saves every intermediate artifact, computes evaluation metrics, and validates its own outputs.
+> **Status:** all five build slices are complete and pushed. Final review fixes are being applied as small commits (§9). This document reflects the code at `ad005bb`.
 
+## 1. What it is
+
+A small, **replayable** AI pipeline for customer-support triage. It:
+
+1. reads `tickets.json` and `label_schema.json` from disk;
+2. cleans each ticket's text deterministically;
+3. classifies **category, urgency and confidence** with a structured LLM call, validated against the schema;
+4. routes each ticket **in code**: confidence `< 0.65` or invalid output goes to `human_review`, everything else to `auto_triage`;
+5. drafts a short customer reply **only for auto-triaged tickets**, and writes an internal escalation note for the rest;
+6. saves every intermediate artifact, computes evaluation metrics, and **validates its own output**.
+
+```bash
+python main.py --tickets tickets.json --schema label_schema.json   # run the pipeline -> outputs/
+python validate.py                                                  # independent artifact checks
+python -m pytest -q                                                 # offline unit tests
 ```
-python main.py --tickets tickets.json --schema label_schema.json
-python validate.py
-```
-
-<!-- TODO(final): confirm commands, flags and output dir against the finished code -->
 
 ---
 
-## 1. How to run
+## 2. Running it
 
 ```bash
 python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt        # macOS/Linux: .venv/bin/pip
-copy .env.example .env                               # then set GROQ_API_KEY
-.venv\Scripts\python main.py --tickets tickets.json --schema label_schema.json
-.venv\Scripts\python validate.py
-.venv\Scripts\python -m pytest -q
+.venv\Scripts\activate                     # macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt
+copy .env.example .env                     # then set GROQ_API_KEY (free key: console.groq.com)
+python main.py --tickets tickets.json --schema label_schema.json
+python validate.py
+python -m pytest -q
+python main.py --replay                    # re-run from saved model outputs, no API calls
 ```
 
-- All artifacts are written to `outputs/` (override with `--out`). The folder is git-ignored on purpose: the brief says static precomputed outputs are not enough, so every run regenerates them from the inputs.
-- To use different fixtures, replace `tickets.json` / `label_schema.json` or pass other paths. No labels or wording are hard-coded.
-
-<!-- TODO(slice 2): document --replay and the LLM env overrides once built -->
-
----
-
-## 2. How I built it
-
-I treated this like a small production task rather than a prompt demo: **spec first, then thin vertical slices, each one run, checked and committed before the next.**
-
-### 2.1 Environment prepared before the session
-- A project `.venv` with only the libraries I expected to need. A preflight script checked git identity, GitHub auth, imports, that `.env` exists and is git-ignored, and made a live API smoke test.
-- **Secrets hygiene:** the API key lives only in `.env`, which is git-ignored. The AI assistant was configured (`.claude/settings.json`) so it could not read or edit `.env`, and the key was never printed in any command output.
-- A written working agreement (`CLAUDE.md`) for the AI pair programmer: plan before code, about 100-line slices, stop after each slice for review, no new dependencies without asking, and if a fix fails twice, step back and simplify.
-
-### 2.2 Spec before code
-Before writing any code, I put the brief into `TASK.md` and wrote `SPEC.md`: a requirements checklist, assumptions, module design, artifact list, build order and test plan. Both were committed first (`758f31a`), so the git history shows the design came before the implementation.
-
-### 2.3 Built in slices
-| Slice | What it delivered | Commit |
+| Flag / env var | Default | Purpose |
 |---|---|---|
-| 1 | Input files, stage guard, loading + deterministic preprocessing, CLI skeleton | `3026ef0` |
-| 2 | Classification LLM call, parsing/validation + recovery, raw-output saving, call logging | <!-- TODO --> |
-| 3 | Deterministic routing, reply generation (auto only), internal notes | <!-- TODO --> |
-| 4 | Evaluation metrics, comparison report, confusion summary, `validate.py` | <!-- TODO --> |
-| 5 | Tests, README, `requirements.txt`, `.env.example` | <!-- TODO --> |
-
-After every slice I ran the pipeline myself, inspected the generated JSON, and only then committed and pushed.
-
-### 2.4 How I used AI
-- **Implementer:** Claude Code in VS Code wrote each slice from my spec and the slice prompt, following the working agreement above.
-- **Independent reviewer:** a second Claude Code session, which did not write the code, checked each slice against `TASK.md` / `SPEC.md`. It ran the code into a scratch folder and tried to break it. For example, it confirmed that the stage guard rejects a skipped stage, and it flagged that `ROUTED -> RESULTS_SAVED` was allowed unconditionally, which I then fixed.
-- **What I owned:** the design and its tradeoffs, the slice boundaries, reading and running every change, and deciding what to accept, change or cut. AI output was treated as a draft to verify, not as an answer.
+| `--tickets`, `--schema` | `tickets.json`, `label_schema.json` | Input files. Swap in any fixtures with the same structure |
+| `--out` | `outputs` | Artifact folder. Git-ignored and regenerated on every run |
+| `--model` / `LLM_MODEL` | `openai/gpt-oss-20b` | Model |
+| `LLM_BASE_URL` | `https://api.groq.com/openai/v1` | Any OpenAI-compatible endpoint |
+| `GROQ_API_KEY` | (required for live calls) | Read from `.env`; never logged |
+| `--replay` | off | Reuse saved raw outputs from `outputs/raw/` instead of calling the API |
 
 ---
 
-## 3. Design
+## 3. Architecture
 
-### 3.1 Data flow and enforced stages
+### 3.1 Stages, enforced in code
 ```
 tickets.json + label_schema.json
-        |
-INIT -> INPUTS_LOADED -> TEXT_PREPROCESSED -> MODEL_PROMPTED -> STRUCTURED_OUTPUT_PARSED
-     -> CONFIDENCE_CHECKED -> ROUTED -> RESPONSE_GENERATED* -> RESULTS_SAVED
-     -> EVALUATION_COMPUTED -> VALIDATION_COMPLETED
-                         (* skipped only if every ticket went to human review)
+  │
+  INIT → INPUTS_LOADED → TEXT_PREPROCESSED → MODEL_PROMPTED → STRUCTURED_OUTPUT_PARSED
+       → CONFIDENCE_CHECKED → ROUTED → RESPONSE_GENERATED* → RESULTS_SAVED
+       → EVALUATION_COMPUTED → VALIDATION_COMPLETED
+  * skipped only when no ticket was auto-triaged
 ```
-`triage/stages.py` defines the stages as an ordered enum. `Pipeline.advance()` raises if a stage is skipped or out of order, so the required sequence is enforced by code, not by convention. The stage history (with timestamps) is saved to `outputs/pipeline_run.json` as evidence of each run.
+`triage/stages.py` defines the stages as an ordered enum. `Pipeline.advance()` raises `Illegal stage transition` on any skipped or out-of-order step. The one permitted skip (`ROUTED → RESULTS_SAVED`) is allowed only when `response_optional` is set, and `main.py` sets it **right after routing, before any reply is drafted**, only if no ticket was auto-triaged. The stage history is written to `outputs/pipeline_run.json`.
 
 ### 3.2 Modules
 | File | Responsibility |
 |---|---|
-| `main.py` | CLI; runs the stages in order and writes artifacts |
-| `triage/stages.py` | Stage enum + transition guard |
-| `triage/preprocess.py` | Load and check inputs; deterministic cleaning and length stats |
-| `triage/llm.py` | LLM client, prompt hashing, raw-output saving, `llm_calls.jsonl` logging |
-| `triage/classify.py` | Schema-driven prompt; parse, validate, recover |
-| `triage/route.py` | Deterministic routing rule |
-| `triage/reply.py` | Reply prompt for auto-triage; internal-note template for human review |
-| `triage/evaluate.py` | Metrics, per-ticket comparison, confusion summary |
-| `validate.py` | Independent checks on the generated artifacts |
-| `tests/` | Unit tests for the deterministic logic, no network |
-
-<!-- TODO(final): reconcile module table with the actual files -->
+| `main.py` | CLI. Each stage is a single-purpose function (`request_classifications`, `parse_classifications`, `generate_responses`, …); `main()` only wires them together and advances the stage guard |
+| `triage/stages.py` | Stage enum and transition guard |
+| `triage/preprocess.py` | Load and check inputs; `clean_text` (collapse whitespace and repeated `!!!` / `???` / `...`); char and word counts |
+| `triage/llm.py` | The **only** module that talks to the provider: client config, `prompt_hash`, raw-output files, `llm_calls.jsonl`, replay. `call()` never raises; errors come back as values |
+| `triage/classify.py` | Prompt built from the schema (normal and strict versions), `extract_json`, pydantic `Classification` model, label checks against the schema |
+| `triage/route.py` | `route()`: pure, deterministic, threshold `0.65` |
+| `triage/reply.py` | Reply prompt, `sentence_count`, internal-note template |
+| `triage/evaluate.py` | Per-ticket comparison, metrics, confusion summary |
+| `validate.py` | Re-checks the artifacts from disk; exit 1 on any failure. Also called in-process at the end of every run |
+| `tests/test_core.py` | 17 offline tests (no network) |
 
 ### 3.3 Artifacts (`outputs/`)
-| Artifact | Produced at stage | Contents |
+| Artifact | Stage | Contents |
 |---|---|---|
 | `preprocessed_tickets.json` | TEXT_PREPROCESSED | `ticket_id`, `original_text`, `cleaned_text`, `char_count`, `word_count` |
-| `raw/…` | MODEL_PROMPTED | Raw model output for every LLM call |
-| `predictions.json` | STRUCTURED_OUTPUT_PARSED | Parsed and validated classification, or the parse error |
+| `raw/<stage>_<ticket_id>_<hash>.json` | per LLM call | Exact messages sent, raw output, error |
+| `predictions.json` | STRUCTURED_OUTPUT_PARSED | Validated prediction or error, plus an **`attempts`** list (first try, strict retry) with each raw file and error |
 | `routing_decisions.json` | ROUTED | `ticket_id`, `route`, `confidence`, `routing_reason` |
-| `triage_results.json` | RESULTS_SAVED | Prediction, route, `customer_reply` or `internal_note` |
-| `llm_calls.jsonl` | every LLM call | stage, ticket, timestamp, provider, model, prompt hash, artifact path |
-| `evaluation_report.json` | EVALUATION_COMPUTED | Category/urgency accuracy, human-review count, parse failures |
-| `prediction_comparison.json` | EVALUATION_COMPUTED | Expected vs predicted per ticket |
-| `confusion_summary.json` | EVALUATION_COMPUTED | Most frequent category mix-ups |
-| `pipeline_run.json` | every stage | Stage history with timestamps |
+| `triage_results.json` | RESULTS_SAVED | Labels, confidence, route, `customer_reply` or `internal_note` |
+| `prediction_comparison.json` | EVALUATION_COMPUTED | Expected vs predicted per ticket, correctness flags, parse error, retried |
+| `evaluation_report.json` | EVALUATION_COMPUTED | Metrics + provider + model |
+| `confusion_summary.json` | EVALUATION_COMPUTED | Most-confused pairs + expected→predicted matrix |
+| `llm_calls.jsonl` | every call | stage, ticket, ISO timestamp, provider, model, prompt hash, artifact path, `replayed`, `error`. Reset each run |
+| `pipeline_run.json` | end | Stage history with timestamps |
 
 ---
 
-## 4. Key decisions and tradeoffs
+## 4. How each requirement is met
 
-| Decision | Why | Tradeoff |
+| Brief | Requirement | Implementation |
 |---|---|---|
-| **Labels are read from `label_schema.json`, never hard-coded** | The evaluator may swap fixtures; the prompt and the validator both use the loaded schema | None worth noting |
-| **Routing is a pure function in code** (`confidence < 0.65` or invalid output -> `human_review`) | The brief requires it; deterministic, testable, auditable. The model's `needs_human_review` is recorded but does not decide | Relies on the model's self-reported confidence (see limitations) |
-| **Invalid model output never crashes the run** | One bad response shouldn't lose the whole batch; it becomes a human-review case with the error as the reason | Those tickets need a person |
-| **Internal notes for human review come from a code template, not an LLM call** | Deterministic and free, and a human-review ticket can never accidentally get a customer-facing reply | Notes are plainer than LLM prose |
-| **Two separate LLM calls (classify, then reply)** | Matches the brief. Replies are conditioned on validated labels and only generated for auto-triage | Two calls per auto ticket |
-| **temperature 0 + every raw output saved and hashed** | Reproducibility and auditability: each prediction can be traced to the exact prompt and raw response | Same input does not always give byte-identical output from hosted models |
-| **OpenAI-compatible client (Groq, `openai/gpt-oss-20b`)** | Free tier, fast, and the provider can be swapped by changing base URL / model | Smaller model than frontier ones |
-| **Preprocessing keeps casing** | "URGENT" or capitals carry urgency signal | Slightly less normalisation |
-| **Generated outputs are git-ignored** | The evaluator deletes and regenerates them; committing them would look like static output | Reviewers must run it to see results |
+| 1 | Load inputs; deterministic preprocessing → `preprocessed_tickets.json` | `load_inputs` checks structure; `clean_text` is a pure function; counts from cleaned text |
+| — | Stages enforced in code | `Pipeline.advance()` guard; conditional skip decided at routing time |
+| 2 | Structured classification; labels from schema in prompt; JSON only; parsed + validated; invalid labels rejected; raw + parsed saved | `build_messages` lists `schema['categories']` / `urgency_levels` verbatim. JSON mode + "valid JSON only" instruction; pydantic types and confidence range; schema membership check; `raw/` + `predictions.json` |
+| 3 | Deterministic routing; `< 0.65` → human review; invalid → human review with reason → `routing_decisions.json` | `route()` pure function. The model's `needs_human_review` is recorded in the reason but **never decides** |
+| 4 | Reply (2–4 sentences, no invented facts or promises) **only** for auto; internal note for human review → `triage_results.json` | Second LLM call for `auto_triage` only, given the predicted labels. `sentence_count` check in code; a failed or off-spec reply is escalated, never sent. Notes from a code template, with no LLM call |
+| 5 | Category/urgency accuracy, human-review count, parse failures; per-ticket comparison | `evaluate.compare` / `compute_metrics`; unlabelled tickets are excluded from accuracy instead of crashing |
+| 6 | `llm_calls.jsonl`, one line per call with the required fields | `LLM.call()` appends after every call, live or replayed |
+| 7 | Validation command | `python validate.py`: artifacts exist, valid JSON, one routing decision per ticket, auto ⇒ reply, human ⇒ note (and no reply), labels in schema, metrics recomputed and matched to the report |
+| 8 | Recovery for malformed output | ① `json.loads` → ② extract first `{…}` from noisy text → ③ validate → ④ **one strict retry** → ⑤ error result routed to human review. Visible in `predictions.json` `attempts` |
+| 9 | Tests | 17 pytest tests: parsing, routing boundary, metrics, preprocessing, stage guard |
+| 10 | CLI | argparse: `--tickets --schema --out --model --replay` |
+| 11 | Confusion summary (stretch) | `confusion_summary.json` |
 
 ---
 
-## 5. Reliability: parsing and recovery
+## 5. Key decisions and tradeoffs
 
-Classification output goes through a fixed ladder, and every step is visible in the artifacts:
-
-1. `json.loads` on the raw response.
-2. If that fails, **extract the first `{...}` object** from noisy text (e.g. prose or code fences around the JSON).
-3. **Validate**: required fields and types, `confidence` in [0, 1], and `category` / `urgency` **must be in the loaded schema**. Anything else is rejected.
-4. If still invalid, **retry once with a stricter prompt**.
-5. If still invalid, record a failed prediction with the error details. Routing sends it to `human_review` with that reason, and it is counted in `parse_validation_failures`.
-
-<!-- TODO(slice 2): confirm each step against triage/classify.py and name the artifact fields that show it -->
-
----
-
-## 6. Engineering practices used
-
-- **Separation of concerns:** loading, preprocessing, the LLM call, parsing, routing, reply generation and evaluation are separate modules with one job each.
-- **Pure, deterministic core logic:** cleaning, routing and metrics are plain functions with no I/O or network, so they are easy to unit test and give the same result every run.
-- **Explicit state machine:** pipeline order is enforced by code, and illegal transitions fail loudly.
-- **Validate at the boundaries:** input files are checked when loaded; model output is validated against the schema before anything downstream uses it.
-- **Fail safe, not fail silent:** bad model output degrades to human review with a recorded reason rather than crashing or being silently accepted.
-- **Configuration over hard-coding:** labels from the schema file, paths and output directory from CLI flags, provider and model from environment variables.
-- **Traceability:** every LLM call is logged with a prompt hash and a pointer to its raw output file.
-- **Secrets handled properly:** the key is read from the environment only, `.env` is git-ignored, `.env.example` documents the variables, and the key is never logged.
-- **Minimal dependencies:** the `openai` client (for an OpenAI-compatible API), `python-dotenv`, and `pytest` for tests. <!-- TODO(final): match requirements.txt -->
-- **Small, reviewable commits:** one slice per commit with an imperative message, pushed after each working step.
-- **Independent validation:** `validate.py` re-checks the artifacts from disk instead of trusting the pipeline's own state.
+| Decision | Why | Tradeoff | Commit |
+|---|---|---|---|
+| **Spec before code** | Requirements, assumptions, design and build order agreed before any implementation | ~15 min of a 60-min session spent planning | `758f31a` |
+| **Stages as an enforced state machine** | The brief says "enforce in code". An illegal order fails loudly, and the history is saved as evidence | Slightly more ceremony in `main.py` | `3026ef0`, `ad005bb` |
+| **Labels only from `label_schema.json`** | The evaluator may swap fixtures; both the prompt and the validator read the file | None | `a302307` |
+| **One provider module, OpenAI-compatible client (Groq, `gpt-oss-20b`)** | Free and fast; provider and model swappable by env var; every call goes through one logged path | Smaller model than frontier APIs | `a302307` |
+| **JSON mode + pydantic + schema membership + one strict retry** | Reliable parsing without crashing; recovery is visible in the artifacts | One extra call for bad outputs | `a302307` |
+| **`temperature=0`, prompt hashing, raw outputs saved, `--replay`** | Reproducibility and auditability: every prediction traces to the exact prompt and response, and a run can be replayed offline | Hosted models aren't perfectly deterministic even at temperature 0 | `a302307` |
+| **Routing is a pure function in code** | Deterministic, testable, auditable. The model flag is advisory only | Relies on self-reported confidence | `f4f32e7` |
+| **Replies only for auto, with a code-level sentence check; failure ⇒ escalate** | An auto ticket is never left without a reply, and an off-spec reply is never sent | Some escalations caused by reply format | `f4f32e7` |
+| **Internal notes are templates, not LLM calls** | Deterministic and free, and an escalated ticket can't get a customer-facing reply | Plainer notes | `f4f32e7` |
+| **`main.py` split into single-purpose stage functions** | Readable orchestration; each stage can be tested in isolation | — | `8f6bcd2` |
+| **Unlabelled tickets excluded from accuracy, kept in the comparison** | Swapped fixtures without labels still run end to end | Accuracy is computed over a subset | `3b59833` |
+| **Validation re-reads artifacts from disk; also runs in-process** | Independent of pipeline state; every run self-checks | Duplicated reads | `3b59833` |
+| **Generated outputs git-ignored** | The brief says static outputs aren't enough; the evaluator deletes and regenerates them | Reviewers must run it to see outputs | `.gitignore` |
+| **Not tuning the prompt to the 6 samples** | With 6 examples, prompt tweaks would overfit the eval set | Leaves a known billing/technical_issue confusion | — |
 
 ---
 
-## 7. Testing and validation
+## 6. Reliability and safety
 
-**Unit tests (`pytest`, no network)** <!-- TODO(slice 5): list actual tests and the result -->
-- Classification parsing: valid JSON, JSON wrapped in noisy text, an invalid category, and garbage.
-- Routing threshold: confidence 0.64 -> human review, 0.65 -> auto triage, invalid output -> human review.
-- Metric calculation on a small hand-built example.
-- Stage guard rejects a skipped stage.
-
-**`python validate.py` checks** <!-- TODO(slice 4): confirm against the implementation -->
-1. All required artifacts exist.
-2. Every JSON file parses, and every `llm_calls.jsonl` line parses.
-3. Every ticket has exactly one routing decision.
-4. Every `auto_triage` ticket has a `customer_reply`.
-5. Every `human_review` ticket has an `internal_note`.
-6. Every predicted label belongs to the schema.
-7. Evaluation metrics can be recomputed from the artifacts.
-
-**End to end:** delete `outputs/`, run `main.py`, then `validate.py` and `pytest`. This is the evaluator's clean-checkout path.
+- **Never crashes on model output.** API errors, empty output, prose, invalid labels and out-of-range confidence all end as a recorded error, a route to `human_review`, and an internal note.
+- **Replies are guarded twice:** the prompt rules from the brief, plus a sentence-count check in code. A reply that fails either way is not sent.
+- **Traceable:** `llm_calls.jsonl` → `raw/` file → exact prompt and response, for every call.
+- **Secrets:** the key is read from the environment only; `.env` is git-ignored, `.env.example` documents the variables, and the key is never printed or logged. The AI assistant was configured so it could not read `.env`.
 
 ---
 
-## 8. Results on the sample tickets
+## 7. Testing and verification
 
-<!-- TODO(final): paste metrics from evaluation_report.json after the final clean run -->
+**Unit tests (17, offline).** Clean JSON; JSON in prose or code fences; invalid category, invalid urgency, confidence 1.5, garbage and `None` all rejected. Routing at 0.64, 0.65 and 0.99; invalid output goes to human review; the model flag alone doesn't force review. Metrics and confusion summary on hand-built rows (unlabelled excluded, not counted wrong). `clean_text` determinism. The stage guard rejects a skipped stage, and the response-stage skip is allowed only when nothing was auto-triaged.
+
+**Independent review.** A second Claude Code session that did not write the code tested each slice:
+| Test | Result |
+|---|---|
+| Live run, sample tickets | All stages complete; all required fields present; 12 calls logged, each pointing to an existing raw file |
+| `--replay` | Identical `triage_results.json`; all calls marked `replayed` |
+| **Swapped fixtures** (5 new tickets: shouty `!!!!` text, one-word "hi", two issues in one, unlabelled, ID rejection) | Ran with no code changes; ambiguous tickets (0.30 / 0.40) went to human review with notes and **no reply call**; the unlabelled ticket was excluded from accuracy |
+| Fault injection (fake LLM) | Garbage then valid JSON → recovered on retry; garbage twice → human review; confidence 0.3 → no reply call; reply API error → escalated with a note |
+| Tamper tests on `validate.py` (13 cases) | Caught 7; the gaps found became review fixes (§9) |
+| Fresh `git clone` | 17/17 tests pass; a run with no key exposed a silent-failure case (§9, #2) |
+
+---
+
+## 8. Results
+
+**Sample tickets (6):**
 | Metric | Value |
 |---|---|
-| Tickets | 6 |
-| Category accuracy | |
-| Urgency accuracy | |
-| Sent to human review | |
-| Parse/validation failures | |
+| Category accuracy | **0.83** (5/6) |
+| Urgency accuracy | **0.67** (4/6) |
+| Sent to human review | 0 |
+| Parse/validation failures | 0 |
+| Classification retries | 0 |
+
+The only category confusion was **billing → technical_issue**: T2, "I withdrew funds… don't see them in my bank account", was read as a technical fault. Urgency was under-rated on T1 (locked out) and T4 (verification question). Model confidence was 0.92–0.95 on every sample ticket.
+
+**Swapped fixtures (5, reviewer's set):** category accuracy 1.0 (4 labelled), urgency 0.75, **2 of 5 routed to human review** (the ambiguous "hi" and the two-issue ticket), 0 parse failures.
 
 ---
 
-## 9. Requirements traceability
+## 9. Review fixes (final hardening)
 
-| # | Requirement | Where | Status |
-|---|---|---|---|
-| 1 | Load inputs + deterministic preprocessing -> `preprocessed_tickets.json` | `triage/preprocess.py`, `main.py` | Done (slice 1) |
-| — | 11 stages enforced in code | `triage/stages.py` | Done (slice 1) |
-| 2 | Structured classification, schema-validated; raw + parsed saved | `triage/classify.py`, `triage/llm.py` | |
-| 3 | Deterministic routing -> `routing_decisions.json` | `triage/route.py` | |
-| 4 | Replies for auto only; internal notes -> `triage_results.json` | `triage/reply.py` | |
-| 5 | Metrics -> `evaluation_report.json`, `prediction_comparison.json` | `triage/evaluate.py` | |
-| 6 | `llm_calls.jsonl` | `triage/llm.py` | |
-| 7 | Validation command | `validate.py` | |
-| 8 | Recovery path for malformed output | `triage/classify.py` | |
-| 9 | Tests | `tests/` | |
-| 10 | CLI | `main.py` | Done (slice 1) |
-| 11 | Confusion summary (stretch) | `triage/evaluate.py` | |
+The independent review produced `TECHNICAL_ISSUES.md`. The fixes are applied as small commits, each run and tested:
+| # | Issue | Status |
+|---|---|---|
+| 1 | Stage guard allowed skipping RESPONSE_GENERATED unconditionally | **Fixed** `ad005bb` (+2 tests) |
+| 2 | No or invalid API key still "passed" with exit 0: all tickets escalated, accuracy 0 | In progress: fail fast on a missing key, and exit 1 if every call fails |
+| 3 | `main.py` exited 0 when validation failed | In progress |
+| 4 | Some replies promised or claimed actions ("we will lock your account immediately") | In progress: tighter prompt + optional phrase guard |
+| 5 | `validate.py` missed 5 of 13 tampering cases (route/confidence consistency, reply calls only for auto, log fields) and crashed on 1 | In progress |
+| 6 | Routing reason misleading after a reply-check escalation | In progress |
+| 7 | Raw traceback on bad input files; duplicate IDs not rejected | In progress |
+| 8 | No offline test of the pipeline flow (retry, replies only for auto) | In progress |
+| 9 | `requirements.txt` not pinned | In progress |
+| 10 | README claims and gaps | In progress |
 
 ---
 
-## 10. Limitations and next steps
+## 10. How I built it
 
-- **Confidence is self-reported by the model and not calibrated.** The 0.65 threshold is applied deterministically, but the score itself is a model guess. Next: calibrate the threshold on a larger labelled set, or combine it with signals such as label/explanation agreement or self-consistency across samples.
-- **Six sample tickets is too few to judge accuracy;** one ticket moves accuracy by about 17 points. Next: a larger labelled evaluation set, including ambiguous and multi-issue tickets.
-- **Reply guardrails are prompt-only.** Next: post-checks in code, e.g. sentence count 2-4 and a list of banned promises like "refund" or "we have fixed", with a fallback to human review.
-- **No rate-limit backoff, and calls run one after another.** Fine for small batches. Next: backoff on 429 errors and parallel calls for larger inputs.
-- **No PII redaction before sending text to the provider.** Next: mask emails, phone numbers and account numbers during preprocessing.
-- **Hosted models are not perfectly deterministic even at temperature 0.** Raw outputs are saved so any run can be audited.
+**Timeline (from the git history)**
+| Time | Commit | Step |
+|---|---|---|
+| 16:50 | `a55066b` | Environment scaffold, before the task was known: `.venv`, packages, preflight script, `.gitignore`, working agreement |
+| 17:02 | `0144e16` | Chose Groq as the LLM provider (free tier, OpenAI-compatible); preflight smoke test passed |
+| 17:32 | `758f31a` | **Spec before code:** `TASK.md` (brief) + `SPEC.md` (requirements, assumptions, design, build order, test plan) |
+| 17:36 | `3026ef0` | Slice 1: inputs, stage guard, preprocessing, CLI |
+| 17:43 | `a302307` | Slice 2: LLM layer, structured classification, recovery, replay |
+| 17:44 | `f4f32e7` | Slice 3: deterministic routing, replies, escalation notes |
+| 17:46 | `8f6bcd2` | Refactor: single-purpose stage functions in `main.py` |
+| 17:50 | `3b59833` | Slice 4: evaluation, confusion summary, `validate.py` |
+| 17:50 | `cf8abca` | Slice 5a: offline tests |
+| 17:51 | `d5795bb` | Slice 5b: README, requirements, `.env.example` |
+| 17:58 | `ad005bb` | First review fix: conditional response-stage skip |
+
+**Working method**
+- **Environment first:** a preflight script checked git, GitHub auth, imports, that `.env` exists and is git-ignored, and made a live API call, so no time was lost on setup during the session.
+- **Thin vertical slices:** each slice was run, inspected and reviewed before being committed and pushed.
+- **A written working agreement** (`CLAUDE.md`) for the AI: plan before code, about 100-line slices, stop after each slice, no new dependencies without asking, simplify if a fix fails twice, never touch `.env`.
+
+**How I used AI**
+- **Implementer:** Claude Code in VS Code wrote each slice from `SPEC.md` and a slice prompt.
+- **Independent reviewer:** a second Claude Code session, which never edited the code, checked every slice against the brief. It ran the code in a scratch folder, tried swapped fixtures, injected faults, tampered with artifacts, and tested a fresh clone. Its findings went back to the implementer as concrete fixes.
+- **What I owned:** the design and tradeoffs, the provider choice, slice boundaries, running and reading every change, deciding what to accept or push back on, and choosing *not* to overfit the prompt to six examples.
+
+---
+
+## 11. Engineering practices
+
+- **Separation of concerns:** one job per module; `main.py` only orchestrates.
+- **Pure, deterministic core:** `clean_text`, `parse_classification`, `route` and the metrics have no I/O, so they're easy to test and give the same result every run.
+- **Explicit state machine** for pipeline order.
+- **Validate at boundaries:** input files on load; model output against a schema before use; artifacts re-checked from disk.
+- **Fail safe, not fail silent:** bad output degrades to human review with a recorded reason.
+- **Configuration over hard-coding:** labels from the schema file, paths from flags, provider and model from env vars.
+- **Traceability:** prompt hashes, raw outputs, per-call log, stage history.
+- **Reproducibility:** `temperature=0`, saved raw outputs, `--replay`.
+- **Secrets hygiene:** env-only key, git-ignored `.env`, documented `.env.example`.
+- **Minimal dependencies:** `openai`, `pydantic`, `python-dotenv`, `pytest`.
+- **Small, reviewed commits** with imperative messages, pushed after each working step.
+
+---
+
+## 12. Limitations and next steps
+
+- **Confidence is self-reported and uncalibrated.** It was 0.92–0.95 on every sample ticket. A security ticket ("someone logged into my account from another country") scored 0.95 and was auto-triaged even though the model itself flagged it for review. That is the brief's rule (confidence decides), and it shows why the signal is weak. *Next:* calibrate the threshold on a larger labelled set; add deterministic overrides (e.g. high urgency plus model flag means human review); use self-consistency across samples.
+- **Small evaluation set:** one ticket moves accuracy by about 17 points. *Next:* a larger labelled set with ambiguous and multi-issue tickets.
+- **No label descriptions or few-shot examples in the prompt.** These would likely fix billing vs technical_issue, but should be tuned on a held-out set, not the six samples.
+- **Reply guardrails** are prompt rules plus a sentence-count check. *Next:* rule-based or LLM-judge checks for invented facts and commitments.
+- **Sequential calls with no rate-limit backoff:** fine for small batches. *Next:* backoff on 429 errors and concurrency.
+- **No PII redaction** before text is sent to the provider. *Next:* mask emails, phone numbers and account numbers during preprocessing.
+- **Prompt injection:** labels can't escape the schema thanks to validation, but reply text could be steered by a malicious ticket.
