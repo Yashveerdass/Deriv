@@ -1,3 +1,8 @@
+## Important
+- Adequate amount of comments(human-friendly)
+- Follow the usual good progrmaming opratcices like using SOLID
+- Pushing consitantly while also testing befire pushing'
+
 ## BUILD
 
 Build a small, replayable AI-powered ticket triage pipeline that reads customer support tickets from local files, classifies each ticket into a category and urgency level, produces a short suggested reply, and routes low-confidence cases to human review.
