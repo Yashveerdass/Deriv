@@ -144,10 +144,12 @@ def main():
     pipeline.advance(Stage.CONFIDENCE_CHECKED)
     save_json(args.out, "routing_decisions.json", routing_decisions)
     pipeline.advance(Stage.ROUTED)
+    # Decided before replies run: the response stage may only be skipped if nothing was auto-triaged.
+    pipeline.response_optional = not any(d["route"] == "auto_triage" for d in routing_decisions)
 
     triage_results = generate_responses(llm, tickets, predictions, routing_decisions)
-    if any(result["route"] == "auto_triage" for result in triage_results):
-        pipeline.advance(Stage.RESPONSE_GENERATED)  # skipped when everything was escalated
+    if not pipeline.response_optional:
+        pipeline.advance(Stage.RESPONSE_GENERATED)  # reply generation ran for at least one ticket
     # Re-save routing: generate_responses may have escalated tickets whose reply failed.
     save_json(args.out, "routing_decisions.json", routing_decisions)
     save_json(args.out, "triage_results.json", triage_results)

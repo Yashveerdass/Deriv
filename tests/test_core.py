@@ -100,3 +100,24 @@ def test_stage_guard_rejects_skipped_stage():
     pipeline.advance(Stage.INPUTS_LOADED)
     with pytest.raises(RuntimeError):
         pipeline.advance(Stage.ROUTED)
+
+
+def _pipeline_at_routed():
+    pipeline = Pipeline()
+    for stage in list(Stage)[1:list(Stage).index(Stage.ROUTED) + 1]:
+        pipeline.advance(stage)
+    return pipeline
+
+
+def test_response_stage_cannot_be_skipped_when_tickets_were_auto_triaged():
+    pipeline = _pipeline_at_routed()
+    pipeline.response_optional = False  # at least one auto_triage ticket
+    with pytest.raises(RuntimeError):
+        pipeline.advance(Stage.RESULTS_SAVED)
+
+
+def test_response_stage_can_be_skipped_when_everything_was_escalated():
+    pipeline = _pipeline_at_routed()
+    pipeline.response_optional = True  # every ticket went to human_review
+    pipeline.advance(Stage.RESULTS_SAVED)
+    assert pipeline.stage == Stage.RESULTS_SAVED

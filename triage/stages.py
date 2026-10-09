@@ -24,11 +24,13 @@ class Pipeline:
     def __init__(self):
         self.stage = Stage.INIT
         self.history = [{"stage": Stage.INIT.value, "at": _now()}]
+        # Set by the caller after routing: True only when no ticket was auto-triaged,
+        # which is the one case where RESPONSE_GENERATED may be skipped.
+        self.response_optional = False
 
     def advance(self, nxt: Stage):
         allowed = {ORDER[ORDER.index(self.stage) + 1]}
-        # RESPONSE_GENERATED is skipped when every ticket went to human review.
-        if self.stage == Stage.ROUTED:
+        if self.stage == Stage.ROUTED and self.response_optional:
             allowed.add(Stage.RESULTS_SAVED)
         if nxt not in allowed:
             raise RuntimeError(f"Illegal stage transition {self.stage.value} -> {nxt.value}")
