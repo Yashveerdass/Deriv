@@ -32,6 +32,7 @@ class LLM:
         self._client = None
 
     def _get_client(self):
+        """Create the API client lazily, so --replay works without a key."""
         if self._client is None:
             key = os.environ.get("GROQ_API_KEY")
             if not key:
@@ -41,24 +42,25 @@ class LLM:
 
     def call(self, stage, ticket_id, messages, json_mode=False):
         """Returns (text or None, error or None, artifact_path). Never raises on API failure."""
-        h = prompt_hash(self.model, messages)
-        path = os.path.join(self.raw_dir, f"{stage}_{ticket_id}_{h}.json")
+        # The raw file is named by prompt hash, so an identical prompt maps to the same file (replay).
+        hash_id = prompt_hash(self.model, messages)
+        path = os.path.join(self.raw_dir, f"{stage}_{ticket_id}_{hash_id}.json")
         replayed = False
         if self.replay and os.path.exists(path):
             with open(path, encoding="utf-8") as f:
-                rec = json.load(f)
-            text, error, replayed = rec["output"], rec["error"], True
-        else:
+                saved = json.load(f)
+            text, error, replayed = saved["output"], saved["error"], True
+        else:  # Live call; any failure is captured as an error string, never raised.
             text, error = None, None
             try:
                 kwargs = {"response_format": {"type": "json_object"}} if json_mode else {}
                 resp = self._get_client().chat.completions.create(
                     model=self.model, messages=messages, temperature=0, **kwargs)
                 text = resp.choices[0].message.content
-            except Exception as e:  # network, auth, rate limit, provider-side JSON rejection
-                error = f"{type(e).__name__}: {str(e)[:300]}"
+            except Exception as exc:  # network, auth, rate limit, provider-side JSON rejection
+                error = f"{type(exc).__name__}: {str(exc)[:300]}"
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({"stage": stage, "ticket_id": ticket_id, "prompt_hash": h,
+                json.dump({"stage": stage, "ticket_id": ticket_id, "prompt_hash": hash_id,
                            "model": self.model, "messages": messages,
                            "output": text, "error": error}, f, indent=2, ensure_ascii=False)
         with open(self.log_path, "a", encoding="utf-8") as f:
@@ -66,7 +68,7 @@ class LLM:
                 "stage": stage, "ticket_id": ticket_id,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "provider": self.provider, "model": self.model,
-                "prompt_hash": h, "output_artifact": path.replace(os.sep, "/"),
+                "prompt_hash": hash_id, "output_artifact": path.replace(os.sep, "/"),
                 "replayed": replayed, "error": error,
             }) + "\n")
         return text, error, path

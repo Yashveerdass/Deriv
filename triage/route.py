@@ -3,16 +3,18 @@ CONFIDENCE_THRESHOLD = 0.65
 
 
 def route(ticket_id, prediction, error, threshold=CONFIDENCE_THRESHOLD):
+    """Pure function: same prediction in, same routing decision out."""
+    # Unparsable or schema-invalid output can never be auto-triaged.
     if prediction is None:
         return {"ticket_id": ticket_id, "route": "human_review", "confidence": 0.0,
                 "routing_reason": f"invalid model output: {error}"}
-    conf = prediction["confidence"]
-    if conf < threshold:
-        reason = f"confidence {conf:.2f} < threshold {threshold}"
-        r = "human_review"
+    confidence = prediction["confidence"]
+    if confidence < threshold:
+        route_name = "human_review"
+        reason = f"confidence {confidence:.2f} < threshold {threshold}"
     else:
-        reason = f"confidence {conf:.2f} >= threshold {threshold}"
-        r = "auto_triage"
+        route_name = "auto_triage"
+        reason = f"confidence {confidence:.2f} >= threshold {threshold}"
     if prediction.get("needs_human_review"):
         reason += " (model also flagged needs_human_review)"
-    return {"ticket_id": ticket_id, "route": r, "confidence": conf, "routing_reason": reason}
+    return {"ticket_id": ticket_id, "route": route_name, "confidence": confidence, "routing_reason": reason}

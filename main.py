@@ -1,4 +1,11 @@
-"""CLI entry point: python main.py --tickets tickets.json --schema label_schema.json"""
+"""CLI entry point for the ticket triage pipeline.
+
+Usage:
+    python main.py --tickets tickets.json --schema label_schema.json [--out outputs] [--replay]
+
+Each stage below is a small function with one job. main() only wires them together
+and advances the Pipeline stage guard, so the order of stages is enforced in one place.
+"""
 import argparse
 import json
 import os
@@ -11,99 +18,141 @@ from triage.route import route
 from triage.stages import Pipeline, Stage
 
 
-def save_json(out_dir, name, data):
-    path = os.path.join(out_dir, name)
+def save_json(out_dir, filename, data):
+    """Write data as pretty-printed JSON and return the file path."""
+    path = os.path.join(out_dir, filename)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     return path
 
 
+def request_classifications(llm, tickets, schema):
+    """First classification attempt for every ticket. Returns {ticket_id: (text, error, artifact_path)}."""
+    return {
+        ticket["ticket_id"]: llm.call("classification", ticket["ticket_id"],
+                                      build_messages(ticket["cleaned_text"], schema), json_mode=True)
+        for ticket in tickets
+    }
+
+
+def _parse_llm_result(llm_result, schema):
+    """Turn an (output, api_error, path) tuple into (prediction, error)."""
+    output_text, api_error, _ = llm_result
+    if api_error:
+        return None, f"llm call failed: {api_error}"
+    return parse_classification(output_text, schema)
+
+
+def parse_classifications(llm, tickets, schema, first_attempts):
+    """Parse and validate each first attempt, retrying once with a stricter prompt on failure."""
+    predictions = []
+    for ticket in tickets:
+        ticket_id = ticket["ticket_id"]
+        llm_result = first_attempts[ticket_id]
+        prediction, error = _parse_llm_result(llm_result, schema)
+        attempts = [{"raw_artifact": llm_result[2], "error": error}]
+
+        if error:  # Recovery path: one retry with a stricter "JSON only" prompt.
+            print(f"  {ticket_id}: {error} -> retrying with strict prompt")
+            llm_result = llm.call("classification", ticket_id,
+                                  build_messages(ticket["cleaned_text"], schema, strict=True), json_mode=True)
+            prediction, error = _parse_llm_result(llm_result, schema)
+            attempts.append({"raw_artifact": llm_result[2], "error": error})
+
+        predictions.append({"ticket_id": ticket_id, "prediction": prediction,
+                            "error": error, "attempts": attempts})
+    return predictions
+
+
+def generate_responses(llm, tickets, predictions, routing_decisions):
+    """Draft a customer reply for auto_triage tickets and an internal note for human_review ones.
+
+    A reply that fails or breaks the 2-4 sentence rule is never sent: the ticket is
+    escalated instead, and its routing decision is updated to say why.
+    """
+    cleaned_text_by_id = {ticket["ticket_id"]: ticket["cleaned_text"] for ticket in tickets}
+    triage_results = []
+    for record, decision in zip(predictions, routing_decisions):
+        ticket_id, prediction = record["ticket_id"], record["prediction"]
+        customer_reply = None
+
+        if decision["route"] == "auto_triage":
+            reply_text, api_error, _ = llm.call("reply_generation", ticket_id, build_reply_messages(
+                cleaned_text_by_id[ticket_id], prediction["category"], prediction["urgency"]))
+            customer_reply = reply_text.strip() if reply_text else None
+            if not customer_reply or not 2 <= sentence_count(customer_reply) <= 4:
+                decision["route"] = "human_review"
+                decision["routing_reason"] += (
+                    f"; reply generation failed ({api_error or 'reply not 2-4 sentences'})")
+                customer_reply = None
+
+        is_escalated = decision["route"] == "human_review"
+        triage_results.append({
+            "ticket_id": ticket_id,
+            "predicted_category": prediction["category"] if prediction else None,
+            "predicted_urgency": prediction["urgency"] if prediction else None,
+            "confidence": decision["confidence"],
+            "route": decision["route"],
+            "customer_reply": customer_reply,
+            "internal_note": internal_note(decision, prediction) if is_escalated else None,
+        })
+    return triage_results
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="AI ticket triage pipeline")
+    parser.add_argument("--tickets", default="tickets.json")
+    parser.add_argument("--schema", default="label_schema.json")
+    parser.add_argument("--out", default="outputs", help="directory for generated artifacts")
+    parser.add_argument("--model", default=None, help="override LLM_MODEL")
+    parser.add_argument("--replay", action="store_true",
+                        help="reuse saved raw outputs instead of calling the API")
+    return parser.parse_args()
+
+
 def main():
-    ap = argparse.ArgumentParser(description="AI ticket triage pipeline")
-    ap.add_argument("--tickets", default="tickets.json")
-    ap.add_argument("--schema", default="label_schema.json")
-    ap.add_argument("--out", default="outputs")
-    ap.add_argument("--model", default=None, help="override LLM_MODEL")
-    ap.add_argument("--replay", action="store_true", help="reuse saved raw outputs instead of calling the API")
-    args = ap.parse_args()
-
+    args = parse_args()
     os.makedirs(args.out, exist_ok=True)
-    p = Pipeline()
+    pipeline = Pipeline()
 
-    tickets, schema = load_inputs(args.tickets, args.schema)
-    p.advance(Stage.INPUTS_LOADED)
-    print(f"Loaded {len(tickets)} tickets, {len(schema['categories'])} categories")
+    raw_tickets, schema = load_inputs(args.tickets, args.schema)
+    pipeline.advance(Stage.INPUTS_LOADED)
+    print(f"Loaded {len(raw_tickets)} tickets, {len(schema['categories'])} categories")
 
-    pre = preprocess(tickets)
-    save_json(args.out, "preprocessed_tickets.json", pre)
-    p.advance(Stage.TEXT_PREPROCESSED)
+    tickets = preprocess(raw_tickets)
+    save_json(args.out, "preprocessed_tickets.json", tickets)
+    pipeline.advance(Stage.TEXT_PREPROCESSED)
 
-    # Fresh call log each run (raw/ is kept so --replay can reuse it).
-    if os.path.exists(os.path.join(args.out, "llm_calls.jsonl")):
-        os.remove(os.path.join(args.out, "llm_calls.jsonl"))
+    # Start a fresh call log each run; raw/ is kept so --replay can reuse it.
+    call_log_path = os.path.join(args.out, "llm_calls.jsonl")
+    if os.path.exists(call_log_path):
+        os.remove(call_log_path)
     llm = LLM(args.out, model=args.model, replay=args.replay)
 
-    first = {}
-    for t in pre:
-        text, err, path = llm.call("classification", t["ticket_id"],
-                                   build_messages(t["cleaned_text"], schema), json_mode=True)
-        first[t["ticket_id"]] = (text, err, path)
-    p.advance(Stage.MODEL_PROMPTED)
+    first_attempts = request_classifications(llm, tickets, schema)
+    pipeline.advance(Stage.MODEL_PROMPTED)
 
-    predictions = []
-    for t in pre:
-        tid = t["ticket_id"]
-        text, err, path = first[tid]
-        pred, perr = parse_classification(text, schema) if not err else (None, f"llm call failed: {err}")
-        attempts = [{"raw_artifact": path, "error": perr}]
-        if perr:  # recovery: one retry with a stricter prompt
-            print(f"  {tid}: {perr} -> retrying with strict prompt")
-            text, err, path = llm.call("classification", tid,
-                                       build_messages(t["cleaned_text"], schema, strict=True), json_mode=True)
-            pred, perr = parse_classification(text, schema) if not err else (None, f"llm call failed: {err}")
-            attempts.append({"raw_artifact": path, "error": perr})
-        predictions.append({"ticket_id": tid, "prediction": pred, "error": perr, "attempts": attempts})
+    predictions = parse_classifications(llm, tickets, schema, first_attempts)
     save_json(args.out, "predictions.json", predictions)
-    p.advance(Stage.STRUCTURED_OUTPUT_PARSED)
-    for r in predictions:
-        print(f"  {r['ticket_id']}: {r['prediction'] or r['error']}")
+    pipeline.advance(Stage.STRUCTURED_OUTPUT_PARSED)
+    for record in predictions:
+        print(f"  {record['ticket_id']}: {record['prediction'] or record['error']}")
 
-    routes = [route(r["ticket_id"], r["prediction"], r["error"]) for r in predictions]
-    p.advance(Stage.CONFIDENCE_CHECKED)
-    save_json(args.out, "routing_decisions.json", routes)
-    p.advance(Stage.ROUTED)
+    routing_decisions = [route(r["ticket_id"], r["prediction"], r["error"]) for r in predictions]
+    pipeline.advance(Stage.CONFIDENCE_CHECKED)
+    save_json(args.out, "routing_decisions.json", routing_decisions)
+    pipeline.advance(Stage.ROUTED)
 
-    text_by_id = {t["ticket_id"]: t["cleaned_text"] for t in pre}
-    results = []
-    for r, rt in zip(predictions, routes):
-        tid, pred = r["ticket_id"], r["prediction"]
-        reply = None
-        if rt["route"] == "auto_triage":
-            reply, err, _ = llm.call("reply_generation", tid, build_reply_messages(
-                text_by_id[tid], pred["category"], pred["urgency"]))
-            reply = reply.strip() if reply else None
-            if not reply or not 2 <= sentence_count(reply) <= 4:
-                # A missing or out-of-spec reply is never sent; escalate instead.
-                rt["route"] = "human_review"
-                rt["routing_reason"] += f"; reply generation failed ({err or 'reply not 2-4 sentences'})"
-                reply = None
-        results.append({
-            "ticket_id": tid,
-            "predicted_category": pred["category"] if pred else None,
-            "predicted_urgency": pred["urgency"] if pred else None,
-            "confidence": rt["confidence"],
-            "route": rt["route"],
-            "customer_reply": reply,
-            "internal_note": internal_note(rt, pred) if rt["route"] == "human_review" else None,
-        })
-    if any(r["route"] == "auto_triage" for r in results):
-        p.advance(Stage.RESPONSE_GENERATED)
-    save_json(args.out, "routing_decisions.json", routes)  # re-save: may include reply-failure escalations
-    save_json(args.out, "triage_results.json", results)
-    p.advance(Stage.RESULTS_SAVED)
+    triage_results = generate_responses(llm, tickets, predictions, routing_decisions)
+    if any(result["route"] == "auto_triage" for result in triage_results):
+        pipeline.advance(Stage.RESPONSE_GENERATED)  # skipped when everything was escalated
+    # Re-save routing: generate_responses may have escalated tickets whose reply failed.
+    save_json(args.out, "routing_decisions.json", routing_decisions)
+    save_json(args.out, "triage_results.json", triage_results)
+    pipeline.advance(Stage.RESULTS_SAVED)
 
-    save_json(args.out, "pipeline_run.json", p.history)
-    print(f"Stage: {p.stage.value}. Artifacts in {args.out}/")
+    save_json(args.out, "pipeline_run.json", pipeline.history)
+    print(f"Stage: {pipeline.stage.value}. Artifacts in {args.out}/")
 
 
 if __name__ == "__main__":
