@@ -9,15 +9,31 @@ def load_json(path):
 
 
 def load_inputs(tickets_path, schema_path):
+    """Load and sanity-check both input files. Raises ValueError with a readable message."""
     tickets = load_json(tickets_path)
     schema = load_json(schema_path)
+
     if not isinstance(tickets, list) or not tickets:
         raise ValueError(f"{tickets_path} must be a non-empty JSON list")
-    for t in tickets:
-        if "ticket_id" not in t or "customer_message" not in t:
-            raise ValueError(f"Ticket missing ticket_id/customer_message: {t}")
-    if not schema.get("categories") or not schema.get("urgency_levels"):
-        raise ValueError(f"{schema_path} needs non-empty categories and urgency_levels")
+    seen_ids = set()
+    for index, ticket in enumerate(tickets):
+        if not isinstance(ticket, dict):
+            raise ValueError(f"{tickets_path}: entry {index} is not a JSON object")
+        if "ticket_id" not in ticket or "customer_message" not in ticket:
+            raise ValueError(f"{tickets_path}: entry {index} is missing ticket_id or customer_message")
+        if not isinstance(ticket["customer_message"], str):
+            raise ValueError(f"{tickets_path}: ticket {ticket['ticket_id']} customer_message is not a string")
+        ticket_id = str(ticket["ticket_id"])
+        if ticket_id in seen_ids:
+            raise ValueError(f"{tickets_path}: duplicate ticket_id {ticket_id}")
+        seen_ids.add(ticket_id)
+
+    if not isinstance(schema, dict):
+        raise ValueError(f"{schema_path} must be a JSON object")
+    for key in ("categories", "urgency_levels"):
+        labels = schema.get(key)
+        if not isinstance(labels, list) or not labels or not all(isinstance(l, str) for l in labels):
+            raise ValueError(f"{schema_path}: '{key}' must be a non-empty list of strings")
     return tickets, schema
 
 

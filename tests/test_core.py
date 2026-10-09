@@ -8,7 +8,7 @@ import pytest
 
 from triage.classify import parse_classification
 from triage.evaluate import compute_metrics, confusion_summary
-from triage.preprocess import clean_text
+from triage.preprocess import clean_text, load_inputs
 from triage.route import route
 from triage.stages import Pipeline, Stage
 
@@ -90,6 +90,20 @@ def test_metrics_and_confusion():
 
 
 # --- Preprocessing and stage guard -----------------------------------------------------------
+
+@pytest.mark.parametrize("tickets, expected_error", [
+    ([{"ticket_id": "A", "customer_message": "x"}, {"ticket_id": "A", "customer_message": "y"}], "duplicate"),
+    (["just a string"], "not a JSON object"),
+    ([{"ticket_id": "A", "customer_message": 42}], "not a string"),
+    ([], "non-empty JSON list"),
+])
+def test_load_inputs_rejects_bad_tickets(tmp_path, tickets, expected_error):
+    tickets_file, schema_file = tmp_path / "t.json", tmp_path / "s.json"
+    tickets_file.write_text(json.dumps(tickets))
+    schema_file.write_text(json.dumps(SCHEMA))
+    with pytest.raises(ValueError, match=expected_error):
+        load_inputs(tickets_file, schema_file)
+
 
 def test_clean_text_is_deterministic():
     assert clean_text("  Help!!!   why??  ") == "Help! why?"

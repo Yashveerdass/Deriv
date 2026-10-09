@@ -9,6 +9,7 @@ and advances the Pipeline stage guard, so the order of stages is enforced in one
 import argparse
 import json
 import os
+import sys
 
 from triage.classify import build_messages, parse_classification
 from triage.evaluate import compare, compute_metrics, confusion_summary
@@ -112,12 +113,24 @@ def parse_args():
     return parser.parse_args()
 
 
+def fail(message):
+    """Print a clean error (no traceback) and exit non-zero."""
+    print(f"ERROR: {message}")
+    sys.exit(1)
+
+
 def main():
     args = parse_args()
+    # Fail fast: without a key every call would fail and the run would look "green" but be useless.
+    if not args.replay and not os.environ.get("GROQ_API_KEY"):
+        fail("GROQ_API_KEY is not set (copy .env.example to .env)")
+    try:
+        raw_tickets, schema = load_inputs(args.tickets, args.schema)
+    except (OSError, ValueError) as exc:  # missing file, invalid JSON (JSONDecodeError), bad structure
+        fail(f"could not load inputs: {exc}")
+
     os.makedirs(args.out, exist_ok=True)
     pipeline = Pipeline()
-
-    raw_tickets, schema = load_inputs(args.tickets, args.schema)
     pipeline.advance(Stage.INPUTS_LOADED)
     print(f"Loaded {len(raw_tickets)} tickets, {len(schema['categories'])} categories")
 
@@ -139,6 +152,11 @@ def main():
     pipeline.advance(Stage.STRUCTURED_OUTPUT_PARSED)
     for record in predictions:
         print(f"  {record['ticket_id']}: {record['prediction'] or record['error']}")
+    # One bad ticket degrades to human review; every call failing means the provider is
+    # unreachable (bad key, outage), so stop instead of producing an all-escalated run.
+    if all((record["error"] or "").startswith("llm call failed") for record in predictions):
+        save_json(args.out, "pipeline_run.json", {"stages": pipeline.history, "aborted": True})
+        fail(f"all LLM calls failed: {predictions[0]['error']}")
 
     routing_decisions = [route(r["ticket_id"], r["prediction"], r["error"]) for r in predictions]
     pipeline.advance(Stage.CONFIDENCE_CHECKED)
@@ -171,8 +189,12 @@ def main():
     pipeline.advance(Stage.VALIDATION_COMPLETED)
     print("Validation passed" if not failures else f"Validation failed ({len(failures)} issues)")
 
-    save_json(args.out, "pipeline_run.json", pipeline.history)
+    save_json(args.out, "pipeline_run.json", {"stages": pipeline.history,
+                                              "validation_passed": not failures,
+                                              "validation_failures": failures})
     print(f"Stage: {pipeline.stage.value}. Artifacts in {args.out}/")
+    if failures:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
