@@ -1,5 +1,7 @@
 # Technical Issues: Final Review Before the Test Run
 
+> **Resolution: all 10 issues fixed.** #1 `ad005bb` · #2, #3, #7 `fae3bba` · #4, #6 `fe304e4` · #5 `ad835fe` · #8 `697b8ad` · #9, #10 `1186e6c`. Verified by `run_acceptance_tests.py` (43/43 passed on a fresh clone, including all 13 tamper cases and the no-key run). The items under "Leave as is" are documented as limitations in README.md and SUBMISSION.md.
+
 **Reviewed at:** commit `d5795bb` (all slices complete), by an independent Claude Code session that did not write the code.
 
 **How it was tested**

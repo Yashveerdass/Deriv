@@ -1,6 +1,6 @@
 # Ticket Triage Pipeline: Submission
 
-> **Status:** all five build slices are complete and pushed. Final review fixes are being applied as small commits (§9). This document reflects the code at `ad005bb`.
+> **Status: complete.** All five build slices and all ten review fixes are pushed. The acceptance suite passes **43/43** against a fresh clone (§7). This document reflects the code at `8276c89`.
 
 ## 1. What it is
 
@@ -17,6 +17,7 @@ A small, **replayable** AI pipeline for customer-support triage. It:
 python main.py --tickets tickets.json --schema label_schema.json   # run the pipeline -> outputs/
 python validate.py                                                  # independent artifact checks
 python -m pytest -q                                                 # offline unit tests
+python run_acceptance_tests.py                                      # 43 end-to-end acceptance tests on a fresh clone
 ```
 
 ---
@@ -69,8 +70,9 @@ tickets.json + label_schema.json
 | `triage/route.py` | `route()`: pure, deterministic, threshold `0.65` |
 | `triage/reply.py` | Reply prompt, `sentence_count`, internal-note template |
 | `triage/evaluate.py` | Per-ticket comparison, metrics, confusion summary |
-| `validate.py` | Re-checks the artifacts from disk; exit 1 on any failure. Also called in-process at the end of every run |
-| `tests/test_core.py` | 17 offline tests (no network) |
+| `validate.py` | Re-checks the artifacts from disk; exit 1 on any failure. Also called in-process at the end of every run. Reports malformed records instead of crashing |
+| `tests/` | 48 offline pytest tests (no network), including flow tests with a scripted `FakeLLM` and 14 validator tamper cases |
+| `run_acceptance_tests.py` | One-command acceptance suite: 43 labelled tests (positive / negative / edge / abnormal) run against a fresh `git clone` |
 
 ### 3.3 Artifacts (`outputs/`)
 | Artifact | Stage | Contents |
@@ -99,9 +101,9 @@ tickets.json + label_schema.json
 | 4 | Reply (2–4 sentences, no invented facts or promises) **only** for auto; internal note for human review → `triage_results.json` | Second LLM call for `auto_triage` only, given the predicted labels. `sentence_count` check in code; a failed or off-spec reply is escalated, never sent. Notes from a code template, with no LLM call |
 | 5 | Category/urgency accuracy, human-review count, parse failures; per-ticket comparison | `evaluate.compare` / `compute_metrics`; unlabelled tickets are excluded from accuracy instead of crashing |
 | 6 | `llm_calls.jsonl`, one line per call with the required fields | `LLM.call()` appends after every call, live or replayed |
-| 7 | Validation command | `python validate.py`: artifacts exist, valid JSON, one routing decision per ticket, auto ⇒ reply, human ⇒ note (and no reply), labels in schema, metrics recomputed and matched to the report |
+| 7 | Validation command | `python validate.py`: artifacts exist, valid JSON, one routing decision **and one result** per ticket, routes agree, auto ⇒ reply and confidence ≥ 0.65, human ⇒ note (and no reply), reply LLM calls only for auto tickets, log lines complete with existing raw files, labels in schema, metrics recomputed and matched to the report |
 | 8 | Recovery for malformed output | ① `json.loads` → ② extract first `{…}` from noisy text → ③ validate → ④ **one strict retry** → ⑤ error result routed to human review. Visible in `predictions.json` `attempts` |
-| 9 | Tests | 17 pytest tests: parsing, routing boundary, metrics, preprocessing, stage guard |
+| 9 | Tests | 48 pytest tests (parsing, routing boundary, reply checks, metrics, input loading, stage guard, validator tamper cases, `FakeLLM` flow tests) + a 43-test acceptance suite |
 | 10 | CLI | argparse: `--tickets --schema --out --model --replay` |
 | 11 | Confusion summary (stretch) | `confusion_summary.json` |
 
@@ -139,7 +141,16 @@ tickets.json + label_schema.json
 
 ## 7. Testing and verification
 
-**Unit tests (17, offline).** Clean JSON; JSON in prose or code fences; invalid category, invalid urgency, confidence 1.5, garbage and `None` all rejected. Routing at 0.64, 0.65 and 0.99; invalid output goes to human review; the model flag alone doesn't force review. Metrics and confusion summary on hand-built rows (unlabelled excluded, not counted wrong). `clean_text` determinism. The stage guard rejects a skipped stage, and the response-stage skip is allowed only when nothing was auto-triaged.
+**Unit tests (48, offline, `pytest`).** Clean JSON; JSON in prose or code fences; invalid category, invalid urgency, confidence 1.5, garbage and `None` all rejected. Routing at 0.64, 0.65 and 0.99; invalid output goes to human review; the model flag alone doesn't force review. Reply checks for sentence count and commitments. Metrics and confusion summary on hand-built rows. Input-loading errors. The stage guard, including the conditional response-stage skip. 14 validator tamper cases. **End-to-end flow tests with a scripted `FakeLLM`:** retry then recover, double failure leading to escalation, low confidence with no reply call, reply API error leading to escalation.
+
+**Acceptance suite (`python run_acceptance_tests.py`): 43/43 passed in 87s.** It clones the committed code into a temp folder (the evaluator's path), so it never touches `outputs/` or `.env`. Each test prints its type, what it checks, and the evidence:
+| Group | Type | Covers | Result |
+|---|---|---|---|
+| U1–U5 | edge / negative / abnormal | Routing boundary 0.65 vs 0.6499; stage guard blocks an illegal skip; reply guard catches commitments (straight and curly apostrophes); 2–4 sentence rule; malformed output recovered or rejected | 5/5 |
+| C1–C9 | negative / abnormal | Missing file, invalid JSON, missing field, duplicate ID, empty list, wrong type, empty schema, **no API key**, **unreachable provider**: each gives a clean `ERROR` with exit 1 and no traceback | 9/9 |
+| A1–A11 | positive | Fresh clone: pytest; full live run; `validate.py`; exact stage order; every required field; preprocessing; routing rule; replies only for auto; call log; metrics recomputed independently; **`--replay` with no key gives identical results** | 11/11 |
+| B1–B5 | edge | Swapped fixtures ("hi", messy text, unlabelled, Spanish + emoji, 2,800 chars, numeric ID); human-review path with no reply call; **a completely different label schema** (`payments`/`access`, `p1`/`p2`/`p3`) | 5/5 |
+| D1–D13 | abnormal | 13 ways of tampering with artifacts, each caught by `validate.py` (FAIL, exit 1, no crash) | 13/13 |
 
 **Independent review.** A second Claude Code session that did not write the code tested each slice:
 | Test | Result |
@@ -148,8 +159,8 @@ tickets.json + label_schema.json
 | `--replay` | Identical `triage_results.json`; all calls marked `replayed` |
 | **Swapped fixtures** (5 new tickets: shouty `!!!!` text, one-word "hi", two issues in one, unlabelled, ID rejection) | Ran with no code changes; ambiguous tickets (0.30 / 0.40) went to human review with notes and **no reply call**; the unlabelled ticket was excluded from accuracy |
 | Fault injection (fake LLM) | Garbage then valid JSON → recovered on retry; garbage twice → human review; confidence 0.3 → no reply call; reply API error → escalated with a note |
-| Tamper tests on `validate.py` (13 cases) | Caught 7; the gaps found became review fixes (§9) |
-| Fresh `git clone` | 17/17 tests pass; a run with no key exposed a silent-failure case (§9, #2) |
+| Tamper tests on `validate.py` (13 cases) | Caught 7 at first; the gaps became review fixes (§9); now 13/13 |
+| Fresh `git clone` | A run with no key first exposed a silent-failure case (§9, #2); it now fails fast |
 
 ---
 
@@ -172,19 +183,19 @@ The only category confusion was **billing → technical_issue**: T2, "I withdrew
 
 ## 9. Review fixes (final hardening)
 
-The independent review produced `TECHNICAL_ISSUES.md`. The fixes are applied as small commits, each run and tested:
-| # | Issue | Status |
-|---|---|---|
-| 1 | Stage guard allowed skipping RESPONSE_GENERATED unconditionally | **Fixed** `ad005bb` (+2 tests) |
-| 2 | No or invalid API key still "passed" with exit 0: all tickets escalated, accuracy 0 | In progress: fail fast on a missing key, and exit 1 if every call fails |
-| 3 | `main.py` exited 0 when validation failed | In progress |
-| 4 | Some replies promised or claimed actions ("we will lock your account immediately") | In progress: tighter prompt + optional phrase guard |
-| 5 | `validate.py` missed 5 of 13 tampering cases (route/confidence consistency, reply calls only for auto, log fields) and crashed on 1 | In progress |
-| 6 | Routing reason misleading after a reply-check escalation | In progress |
-| 7 | Raw traceback on bad input files; duplicate IDs not rejected | In progress |
-| 8 | No offline test of the pipeline flow (retry, replies only for auto) | In progress |
-| 9 | `requirements.txt` not pinned | In progress |
-| 10 | README claims and gaps | In progress |
+The independent review produced `TECHNICAL_ISSUES.md`. Every issue was fixed in a small commit, then verified by the acceptance suite:
+| # | Issue | Fix | Commit |
+|---|---|---|---|
+| 1 | Stage guard allowed skipping RESPONSE_GENERATED unconditionally | Skip allowed only if routing auto-triaged nothing; decided before replies run (+2 tests) | `ad005bb` |
+| 2 | No or invalid API key still "passed" with exit 0: all tickets escalated, accuracy 0 | Fail fast before any stage if the key is missing; exit 1 if every LLM call fails | `fae3bba` |
+| 3 | `main.py` exited 0 when validation failed | Exit 1; `pipeline_run.json` records `validation_passed` and the failures | `fae3bba` |
+| 4 | Some replies promised or claimed actions ("we will lock your account immediately") | Stricter prompt (no claimed or promised actions, no policy) + `reply_problem` code guard; a rejected reply leads to escalation | `fe304e4` |
+| 5 | `validate.py` missed 5 of 13 tampering cases and crashed on 1 | Added checks: one result per ticket, routes agree, auto ⇒ confidence ≥ 0.65, reply calls only for auto, log fields + raw files; malformed records reported, not raised | `ad835fe` |
+| 6 | Routing reason misleading after a reply-check escalation | Reason now starts with `escalated after reply check:` | `fe304e4` |
+| 7 | Raw traceback on bad input files; duplicate IDs not rejected | Clean `ERROR:` + exit 1; duplicate, type and structure checks in `load_inputs` | `fae3bba` |
+| 8 | No offline test of the pipeline flow | `FakeLLM` flow tests: retry, escalation, no reply call for review tickets | `697b8ad` |
+| 9 | `requirements.txt` not pinned | Pinned to the tested versions | `1186e6c` |
+| 10 | README claims and gaps | README updated for final behaviour, exit codes, link to this document | `1186e6c` |
 
 ---
 
@@ -203,7 +214,14 @@ The independent review produced `TECHNICAL_ISSUES.md`. The fixes are applied as 
 | 17:50 | `3b59833` | Slice 4: evaluation, confusion summary, `validate.py` |
 | 17:50 | `cf8abca` | Slice 5a: offline tests |
 | 17:51 | `d5795bb` | Slice 5b: README, requirements, `.env.example` |
-| 17:58 | `ad005bb` | First review fix: conditional response-stage skip |
+| 17:58 | `ad005bb` | Review fix #1: conditional response-stage skip |
+| — | `fae3bba` | Review fixes #2, #3, #7: fail fast on missing key, dead provider, bad inputs, failed validation |
+| — | `fe304e4` | Review fixes #4, #6: no commitments in replies, code guard, clearer escalation reason |
+| — | `ad835fe` | Review fix #5: hardened `validate.py` |
+| — | `697b8ad` | Review fix #8: offline pipeline-flow tests with a scripted `FakeLLM` |
+| — | `1186e6c` | Review fixes #9, #10: pinned requirements, README for final behaviour |
+| — | `83af012` | Submission notes and technical-issues review committed |
+| — | `8276c89` | Acceptance suite: 43 labelled end-to-end tests, all passing |
 
 **Working method**
 - **Environment first:** a preflight script checked git, GitHub auth, imports, that `.env` exists and is git-ignored, and made a live API call, so no time was lost on setup during the session.
@@ -212,7 +230,7 @@ The independent review produced `TECHNICAL_ISSUES.md`. The fixes are applied as 
 
 **How I used AI**
 - **Implementer:** Claude Code in VS Code wrote each slice from `SPEC.md` and a slice prompt.
-- **Independent reviewer:** a second Claude Code session, which never edited the code, checked every slice against the brief. It ran the code in a scratch folder, tried swapped fixtures, injected faults, tampered with artifacts, and tested a fresh clone. Its findings went back to the implementer as concrete fixes.
+- **Independent reviewer:** a second Claude Code session, which never edited the pipeline code, checked every slice against the brief. It ran the code in a scratch folder, tried swapped fixtures, injected faults, tampered with artifacts, and tested a fresh clone. Its findings went back to the implementer as a written issue list (`TECHNICAL_ISSUES.md`) of concrete fixes. It also wrote the acceptance suite (`run_acceptance_tests.py`).
 - **What I owned:** the design and tradeoffs, the provider choice, slice boundaries, running and reading every change, deciding what to accept or push back on, and choosing *not* to overfit the prompt to six examples.
 
 ---
@@ -228,7 +246,8 @@ The independent review produced `TECHNICAL_ISSUES.md`. The fixes are applied as 
 - **Traceability:** prompt hashes, raw outputs, per-call log, stage history.
 - **Reproducibility:** `temperature=0`, saved raw outputs, `--replay`.
 - **Secrets hygiene:** env-only key, git-ignored `.env`, documented `.env.example`.
-- **Minimal dependencies:** `openai`, `pydantic`, `python-dotenv`, `pytest`.
+- **Minimal, pinned dependencies:** `openai`, `pydantic`, `python-dotenv`, `pytest`, at exact tested versions.
+- **Tested at three levels:** pure-function unit tests, `FakeLLM` flow tests, and a live acceptance suite on a fresh clone.
 - **Small, reviewed commits** with imperative messages, pushed after each working step.
 
 ---
@@ -238,7 +257,7 @@ The independent review produced `TECHNICAL_ISSUES.md`. The fixes are applied as 
 - **Confidence is self-reported and uncalibrated.** It was 0.92–0.95 on every sample ticket. A security ticket ("someone logged into my account from another country") scored 0.95 and was auto-triaged even though the model itself flagged it for review. That is the brief's rule (confidence decides), and it shows why the signal is weak. *Next:* calibrate the threshold on a larger labelled set; add deterministic overrides (e.g. high urgency plus model flag means human review); use self-consistency across samples.
 - **Small evaluation set:** one ticket moves accuracy by about 17 points. *Next:* a larger labelled set with ambiguous and multi-issue tickets.
 - **No label descriptions or few-shot examples in the prompt.** These would likely fix billing vs technical_issue, but should be tuned on a held-out set, not the six samples.
-- **Reply guardrails** are prompt rules plus a sentence-count check. *Next:* rule-based or LLM-judge checks for invented facts and commitments.
+- **Reply guardrails** are prompt rules plus a keyword guard and a sentence-count check. They can't catch every invented fact, and abbreviations like "e.g." can be miscounted as sentence breaks. *Next:* an LLM-judge check for invented facts.
 - **Sequential calls with no rate-limit backoff:** fine for small batches. *Next:* backoff on 429 errors and concurrency.
 - **No PII redaction** before text is sent to the provider. *Next:* mask emails, phone numbers and account numbers during preprocessing.
 - **Prompt injection:** labels can't escape the schema thanks to validation, but reply text could be steered by a malicious ticket.

@@ -13,6 +13,7 @@ python main.py --tickets tickets.json --schema label_schema.json   # full live r
 python validate.py                                                  # independent artifact checks (exit 1 on failure)
 python -m pytest -q                                                 # offline unit tests
 python main.py --replay                                             # rerun from saved raw outputs, no API calls
+python run_acceptance_tests.py                                      # 43 end-to-end acceptance tests on a fresh clone (~90s, live calls)
 ```
 Flags: `--out DIR` (default `outputs`), `--model NAME`, `--replay`.
 
