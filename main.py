@@ -15,7 +15,7 @@ from triage.classify import build_messages, parse_classification
 from triage.evaluate import compare, compute_metrics, confusion_summary
 from triage.llm import LLM
 from triage.preprocess import load_inputs, preprocess
-from triage.reply import build_reply_messages, internal_note, sentence_count
+from triage.reply import build_reply_messages, internal_note, reply_problem
 from triage.route import route
 from triage.stages import Pipeline, Stage
 from validate import validate
@@ -70,8 +70,8 @@ def parse_classifications(llm, tickets, schema, first_attempts):
 def generate_responses(llm, tickets, predictions, routing_decisions):
     """Draft a customer reply for auto_triage tickets and an internal note for human_review ones.
 
-    A reply that fails or breaks the 2-4 sentence rule is never sent: the ticket is
-    escalated instead, and its routing decision is updated to say why.
+    A reply that fails, breaks the 2-4 sentence rule or makes a commitment is never sent:
+    the ticket is escalated instead, and its routing decision is updated to say why.
     """
     cleaned_text_by_id = {ticket["ticket_id"]: ticket["cleaned_text"] for ticket in tickets}
     triage_results = []
@@ -83,10 +83,11 @@ def generate_responses(llm, tickets, predictions, routing_decisions):
             reply_text, api_error, _ = llm.call("reply_generation", ticket_id, build_reply_messages(
                 cleaned_text_by_id[ticket_id], prediction["category"], prediction["urgency"]))
             customer_reply = reply_text.strip() if reply_text else None
-            if not customer_reply or not 2 <= sentence_count(customer_reply) <= 4:
+            problem = f"reply call failed: {api_error}" if api_error else reply_problem(customer_reply)
+            if problem:
                 decision["route"] = "human_review"
-                decision["routing_reason"] += (
-                    f"; reply generation failed ({api_error or 'reply not 2-4 sentences'})")
+                decision["routing_reason"] = (f"escalated after reply check: {problem} "
+                                              f"(classification confidence {decision['confidence']:.2f})")
                 customer_reply = None
 
         is_escalated = decision["route"] == "human_review"

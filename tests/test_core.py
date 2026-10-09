@@ -9,6 +9,7 @@ import pytest
 from triage.classify import parse_classification
 from triage.evaluate import compute_metrics, confusion_summary
 from triage.preprocess import clean_text, load_inputs
+from triage.reply import reply_problem
 from triage.route import route
 from triage.stages import Pipeline, Stage
 
@@ -67,6 +68,21 @@ def test_model_flag_alone_does_not_force_review():
     # Routing is decided by code; the model's flag is recorded in the reason only.
     decision = route("T1", {"confidence": 0.9, "needs_human_review": True}, None)
     assert decision["route"] == "auto_triage" and "model also flagged" in decision["routing_reason"]
+
+
+# --- Reply checks ------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("reply, expected", [
+    ("Sorry you cannot log in. Your request will be reviewed by the appropriate team.", None),
+    ("Sorry about that. We will lock your account immediately.", "commitment"),
+    ("Thanks for the idea. We’ve logged this with the product team.", "commitment"),
+    ("Thanks for writing in. We'll sort out a refund.", "commitment"),
+    ("Only one sentence here.", "expected 2-4"),
+    ("", "empty"),
+])
+def test_reply_problem(reply, expected):
+    problem = reply_problem(reply)
+    assert problem is None if expected is None else expected in problem
 
 
 # --- Metrics -----------------------------------------------------------------------------------
