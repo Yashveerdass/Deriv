@@ -11,11 +11,13 @@ import json
 import os
 
 from triage.classify import build_messages, parse_classification
+from triage.evaluate import compare, compute_metrics, confusion_summary
 from triage.llm import LLM
 from triage.preprocess import load_inputs, preprocess
 from triage.reply import build_reply_messages, internal_note, sentence_count
 from triage.route import route
 from triage.stages import Pipeline, Stage
+from validate import validate
 
 
 def save_json(out_dir, filename, data):
@@ -150,6 +152,22 @@ def main():
     save_json(args.out, "routing_decisions.json", routing_decisions)
     save_json(args.out, "triage_results.json", triage_results)
     pipeline.advance(Stage.RESULTS_SAVED)
+
+    comparison = compare(raw_tickets, predictions, triage_results)
+    metrics = compute_metrics(comparison)
+    save_json(args.out, "prediction_comparison.json", comparison)
+    save_json(args.out, "evaluation_report.json",
+              {"metrics": metrics, "provider": llm.provider, "model": llm.model})
+    save_json(args.out, "confusion_summary.json", confusion_summary(comparison))
+    pipeline.advance(Stage.EVALUATION_COMPUTED)
+    print(f"Metrics: {json.dumps(metrics)}")
+
+    # Same checks as `python validate.py`, run in-process so every run self-checks.
+    failures = validate(args.out, args.tickets, args.schema)
+    for failure in failures:
+        print(f"  VALIDATION FAIL: {failure}")
+    pipeline.advance(Stage.VALIDATION_COMPLETED)
+    print("Validation passed" if not failures else f"Validation failed ({len(failures)} issues)")
 
     save_json(args.out, "pipeline_run.json", pipeline.history)
     print(f"Stage: {pipeline.stage.value}. Artifacts in {args.out}/")
